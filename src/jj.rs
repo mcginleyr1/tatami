@@ -5,14 +5,17 @@ use anyhow::{Context, Result, bail};
 
 pub struct Commit {
     pub id: String,
+    pub change_id: String,
     pub parents: Vec<String>,
     pub conflict: bool,
     pub description: String,
 }
 
 impl Commit {
+    /// The change ID prefix shown to users; unlike the commit ID it survives
+    /// the rewrites `tatami fix` and the user's own fixes make.
     pub fn short(&self) -> &str {
-        &self.id[..12.min(self.id.len())]
+        &self.change_id[..12.min(self.change_id.len())]
     }
 
     pub fn subject(&self) -> &str {
@@ -60,7 +63,7 @@ pub struct RemotePush {
     pub updates: Vec<RefUpdate>,
 }
 
-const COMMIT_TEMPLATE: &str = r#"commit_id ++ "\0" ++ parents.map(|c| c.commit_id()).join(" ") ++ "\0" ++ if(conflict, "1", "0") ++ "\0" ++ description ++ "\0""#;
+const COMMIT_TEMPLATE: &str = r#"commit_id ++ "\0" ++ change_id ++ "\0" ++ parents.map(|c| c.commit_id()).join(" ") ++ "\0" ++ if(conflict, "1", "0") ++ "\0" ++ description ++ "\0""#;
 
 pub fn command() -> Command {
     let mut cmd = Command::new("jj");
@@ -111,14 +114,15 @@ pub fn commits(root: &Path, revset: &str) -> Result<Vec<Commit>> {
         return Ok(vec![]);
     };
     let fields: Vec<&str> = out.split('\0').collect();
-    let (records, rest) = fields.as_chunks::<4>();
+    let (records, rest) = fields.as_chunks::<5>();
     if !rest.is_empty() {
         bail!("unexpected `jj log` output for revset {revset:?}");
     }
     Ok(records
         .iter()
-        .map(|[id, parents, conflict, description]| Commit {
+        .map(|[id, change_id, parents, conflict, description]| Commit {
             id: id.to_string(),
+            change_id: change_id.to_string(),
             parents: parents.split_whitespace().map(String::from).collect(),
             conflict: *conflict == "1",
             description: description.to_string(),
@@ -135,6 +139,33 @@ pub fn resolve(root: &Path, revision: &str) -> Result<String> {
         bail!("revision {revision:?} resolved to nothing");
     }
     Ok(id)
+}
+
+/// Names of the `jj fix` tools in the user's config, as TOML keys.
+pub fn fix_tool_names(root: &Path) -> Result<Vec<String>> {
+    let names = run(
+        root,
+        &["config", "list", "fix.tools", "-T", r#"name ++ "\n""#],
+    )?;
+    let mut tools: Vec<String> = names.lines().filter_map(fix_tool_name).collect();
+    tools.dedup();
+    Ok(tools)
+}
+
+/// `fix.tools.black.command` -> `black`; `fix.tools."a.b".patterns` -> `"a.b"`.
+fn fix_tool_name(key: &str) -> Option<String> {
+    let rest = key.strip_prefix("fix.tools.")?;
+    let name = match rest.strip_prefix('"') {
+        Some(quoted) => &rest[..quoted.find('"')? + 2],
+        None => rest.split('.').next()?,
+    };
+    Some(name.to_string())
+}
+
+/// A double-quoted string literal, valid in both TOML and jj's revset and
+/// fileset languages.
+pub fn quote(s: &str) -> String {
+    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
 pub fn remote_url(root: &Path, remote: &str) -> Result<String> {
@@ -275,6 +306,19 @@ Changes to push to upstream:
         assert_eq!(pushes.len(), 2);
         assert_eq!(pushes[1].remote, "upstream");
         assert_eq!(pushes[1].updates[0].name, "b");
+    }
+
+    #[test]
+    fn extracts_fix_tool_names() {
+        assert_eq!(
+            fix_tool_name("fix.tools.black.command").as_deref(),
+            Some("black")
+        );
+        assert_eq!(
+            fix_tool_name(r#"fix.tools."a.b".patterns"#).as_deref(),
+            Some(r#""a.b""#)
+        );
+        assert_eq!(fix_tool_name("ui.editor"), None);
     }
 
     #[test]

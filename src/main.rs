@@ -1,3 +1,4 @@
+mod fix;
 mod jj;
 mod shadow;
 
@@ -39,6 +40,9 @@ enum Cli {
         /// Skip the hooks and just push.
         #[arg(long)]
         no_verify: bool,
+        /// Apply the hooks' fixes to the commits first (see `tatami fix`).
+        #[arg(long)]
+        fix: bool,
         /// Arguments for `jj git push`.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
@@ -48,6 +52,14 @@ enum Cli {
         #[arg(short, long, default_value = "trunk()..@")]
         revisions: String,
     },
+    /// Rewrite each commit in a revset with what its pre-commit hooks fix.
+    Fix {
+        #[arg(short, long, default_value = "trunk()..@")]
+        revisions: String,
+    },
+    /// Internal: the `jj fix` tool used by `tatami fix`.
+    #[command(hide = true)]
+    FixTool { path: String },
     /// Add a `jj push` alias that runs `tatami push`.
     Install {
         /// Write the alias to user config instead of this repo's config.
@@ -76,10 +88,20 @@ fn run(cli: Cli) -> Result<ExitCode> {
     match cli {
         Cli::Push {
             no_verify,
+            fix,
             mut args,
         } => {
-            let no_verify = no_verify || args.iter().any(|a| a == "--no-verify");
-            args.retain(|a| a != "--no-verify");
+            // tatami's flags may also come after `jj git push` arguments.
+            let mut take = |flag: &str| {
+                let found = args.iter().any(|a| a == flag);
+                args.retain(|a| a != flag);
+                found
+            };
+            let fix = take("--fix") || fix;
+            let no_verify = take("--no-verify") || no_verify;
+            if fix {
+                fix_push(&args)?;
+            }
             if !no_verify {
                 verify_push(&args)?;
             }
@@ -98,6 +120,16 @@ fn run(cli: Cli) -> Result<ExitCode> {
             if let Some((shadow, hooks)) = shadow_with_hooks(&root)? {
                 check_commits(&shadow, &hooks, &commits)?;
             }
+            Ok(ExitCode::SUCCESS)
+        }
+        Cli::Fix { revisions } => {
+            let root = jj::workspace_root()?;
+            let commits = jj::commits(&root, &revisions)?;
+            fix_commits(&root, &commits)?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Cli::FixTool { path } => {
+            fix::tool(&path)?;
             Ok(ExitCode::SUCCESS)
         }
         Cli::Install { user } => {
@@ -122,8 +154,8 @@ fn run(cli: Cli) -> Result<ExitCode> {
     }
 }
 
-fn verify_push(args: &[String]) -> Result<()> {
-    let root = jj::workspace_root()?;
+/// What `jj git push <args>` would do, and the commits it would send.
+fn push_plan(root: &Path, args: &[String]) -> Result<(Vec<RemotePush>, Vec<Commit>)> {
     let dry = jj::command()
         .args(["git", "push", "--dry-run"])
         .args(args)
@@ -137,11 +169,20 @@ fn verify_push(args: &[String]) -> Result<()> {
         bail!("`jj git push --dry-run` failed:\n{}", text.trim_end());
     }
     let pushes = jj::parse_dry_run(&text)?;
-    let Some(revset) = revset_to_check(&pushes) else {
-        return Ok(());
+    let commits = match revset_to_check(&pushes) {
+        Some(revset) => jj::commits(root, &revset)?,
+        None => vec![],
     };
-    let commits = jj::commits(&root, &revset)?;
     validate(&commits)?;
+    Ok((pushes, commits))
+}
+
+fn verify_push(args: &[String]) -> Result<()> {
+    let root = jj::workspace_root()?;
+    let (pushes, commits) = push_plan(&root, args)?;
+    if commits.is_empty() {
+        return Ok(());
+    }
     let Some((shadow, hooks)) = shadow_with_hooks(&root)? else {
         return Ok(());
     };
@@ -150,6 +191,26 @@ fn verify_push(args: &[String]) -> Result<()> {
         run_pre_push(&root, &shadow, &pushes)?;
     }
     Ok(())
+}
+
+fn fix_push(args: &[String]) -> Result<()> {
+    let root = jj::workspace_root()?;
+    let (_, commits) = push_plan(&root, args)?;
+    fix_commits(&root, &commits)
+}
+
+fn fix_commits(root: &Path, commits: &[Commit]) -> Result<()> {
+    if commits.is_empty() {
+        return Ok(());
+    }
+    validate(commits)?;
+    match shadow_with_hooks(root)? {
+        Some((shadow, hooks)) if hooks.pre_commit => fix::fix(root, &shadow, commits),
+        _ => {
+            eprintln!("tatami: no pre-commit hooks installed; nothing to fix");
+            Ok(())
+        }
+    }
 }
 
 /// Every commit being sent: ancestors of the new targets that the remote
@@ -163,11 +224,11 @@ fn revset_to_check(pushes: &[RemotePush]) -> Option<String> {
                 .iter()
                 .filter_map(|u| u.new.as_deref())
                 .collect();
-            let remote = push.remote.replace('\\', "\\\\").replace('"', "\\\"");
             (!heads.is_empty()).then(|| {
                 format!(
-                    "(::({}) ~ ::(remote_bookmarks(remote=exact:\"{remote}\") | immutable_heads()))",
-                    heads.join(" | ")
+                    "(::({}) ~ ::(remote_bookmarks(remote=exact:{}) | immutable_heads()))",
+                    heads.join(" | "),
+                    jj::quote(&push.remote)
                 )
             })
         })

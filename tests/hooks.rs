@@ -15,6 +15,17 @@ if git diff --cached | grep -q '^+.*FORBIDD[E]N'; then
 fi
 "#;
 
+/// Strips trailing whitespace from staged files and fails if it changed
+/// anything, like pre-commit's trailing-whitespace fixer.
+const FIXER: &str = r#"#!/bin/sh
+changed=0
+for f in $(git diff --cached --name-only --diff-filter=ACM); do
+  sed 's/[[:space:]]*$//' "$f" > "$f.tmp"
+  if cmp -s "$f" "$f.tmp"; then rm "$f.tmp"; else mv "$f.tmp" "$f"; changed=1; fi
+done
+exit $changed
+"#;
+
 struct Repo {
     tmp: TempDir,
     root: PathBuf,
@@ -370,21 +381,122 @@ fn check_runs_hooks_over_a_revset_without_pushing() {
 }
 
 #[test]
-fn works_with_the_real_pre_commit_framework() {
+fn fix_rewrites_each_commit_and_its_descendants_without_conflicts() {
+    let repo = Repo::new();
+    repo.hook("pre-commit", FIXER);
+    repo.commit("a.txt", "one  \n", "add a");
+    repo.write("a.txt", "one  \ntwo  \n");
+    repo.commit("b.txt", "b  \n", "extend a, add b");
+
+    let out = repo.tatami(&["fix", "-r", "main..@"]);
+
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(repo.jj(&["file", "show", "-r", "@--", "a.txt"]), "one\n");
+    assert_eq!(
+        repo.jj(&["file", "show", "-r", "@-", "a.txt"]),
+        "one\ntwo\n"
+    );
+    assert_eq!(repo.jj(&["file", "show", "-r", "@-", "b.txt"]), "b\n");
+    assert_eq!(
+        repo.jj(&["log", "--no-graph", "-r", "conflicts()", "-T", "commit_id"]),
+        ""
+    );
+    let check = repo.tatami(&["check", "-r", "main..@"]);
+    assert!(check.status.success(), "{}", stderr(&check));
+}
+
+#[test]
+fn push_fix_applies_fixes_and_then_pushes() {
+    let repo = Repo::new();
+    repo.hook("pre-commit", FIXER);
+    repo.commit("a.txt", "x  \n", "add a");
+    repo.jj(&["bookmark", "create", "feature", "-r", "@-"]);
+
+    let out = repo.tatami(&["push", "-b", "feature", "--fix"]);
+
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(repo.jj(&["file", "show", "-r", "feature", "a.txt"]), "x\n");
+    assert!(repo.remote_has("feature"));
+}
+
+#[test]
+fn fix_applies_what_it_can_and_reports_the_rest() {
+    let repo = Repo::new();
+    let fix_then_lint = FIXER.replace(
+        "exit $changed",
+        "git diff --cached | grep -q '^+.*FORBIDD[E]N' && exit 1\nexit $changed",
+    );
+    repo.hook("pre-commit", &fix_then_lint);
+    repo.commit("a.txt", "FORBIDDEN  \n", "add a");
+
+    let out = repo.tatami(&["fix", "-r", "main..@"]);
+
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("hooks still fail after fixing"),
+        "{}",
+        stderr(&out)
+    );
+    assert_eq!(
+        repo.jj(&["file", "show", "-r", "@-", "a.txt"]),
+        "FORBIDDEN\n"
+    );
+}
+
+#[test]
+fn fix_does_not_run_the_users_own_jj_fix_tools() {
+    let repo = Repo::new();
+    repo.jj(&[
+        "config",
+        "set",
+        "--repo",
+        "fix.tools.upper.command",
+        r#"["tr", "a-z", "A-Z"]"#,
+    ]);
+    repo.jj(&[
+        "config",
+        "set",
+        "--repo",
+        "fix.tools.upper.patterns",
+        r#"["all()"]"#,
+    ]);
+    repo.hook("pre-commit", FIXER);
+    repo.commit("a.txt", "x  \n", "add a");
+
+    let out = repo.tatami(&["fix", "-r", "main..@"]);
+
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(repo.jj(&["file", "show", "-r", "@-", "a.txt"]), "x\n");
+}
+
+#[test]
+fn fix_works_with_a_real_pre_commit_fixer() {
+    let Some(repo) = pre_commit_repo(
+        "repos:\n- repo: local\n  hooks:\n  - id: strip\n    name: strip trailing whitespace\n    language: system\n    entry: perl -pi -e 's/[ \\t]+$//'\n    types: [text]\n",
+    ) else {
+        return;
+    };
+    repo.commit("a.txt", "x  \n", "add a");
+
+    let out = repo.tatami(&["fix", "-r", "main..@"]);
+
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(repo.jj(&["file", "show", "-r", "@-", "a.txt"]), "x\n");
+}
+
+/// A repo using the real pre-commit framework with `config`, or None when
+/// `uvx pre-commit` isn't available.
+fn pre_commit_repo(config: &str) -> Option<Repo> {
     let available = Command::new("uvx")
         .args(["pre-commit", "--version"])
         .output()
         .is_ok_and(|o| o.status.success());
     if !available {
         eprintln!("skipping: `uvx pre-commit` unavailable");
-        return;
+        return None;
     }
     let repo = Repo::new();
-    repo.commit(
-        ".pre-commit-config.yaml",
-        "repos:\n- repo: local\n  hooks:\n  - id: no-forbidden\n    name: no forbidden marker\n    language: pygrep\n    entry: FORBIDD[E]N\n",
-        "add pre-commit config",
-    );
+    repo.commit(".pre-commit-config.yaml", config, "add pre-commit config");
     let mut install = Command::new("uvx");
     install
         .current_dir(&repo.root)
@@ -392,6 +504,16 @@ fn works_with_the_real_pre_commit_framework() {
     repo.env(&mut install);
     let out = install.output().unwrap();
     assert!(out.status.success(), "pre-commit install: {}", stderr(&out));
+    Some(repo)
+}
+
+#[test]
+fn works_with_the_real_pre_commit_framework() {
+    let Some(repo) = pre_commit_repo(
+        "repos:\n- repo: local\n  hooks:\n  - id: no-forbidden\n    name: no forbidden marker\n    language: pygrep\n    entry: FORBIDD[E]N\n",
+    ) else {
+        return;
+    };
     repo.commit("a.txt", "FORBIDDEN\n", "add a");
     repo.commit("a.txt", "fine now\n", "fix a");
     repo.jj(&["bookmark", "create", "feature", "-r", "@-"]);

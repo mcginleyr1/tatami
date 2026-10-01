@@ -43,7 +43,7 @@ fn git<S: AsRef<OsStr>>(dir: &Path, args: &[S]) -> Command {
     cmd
 }
 
-fn output(mut cmd: Command) -> Result<String> {
+fn output_bytes(mut cmd: Command) -> Result<Vec<u8>> {
     let out = cmd
         .output()
         .with_context(|| format!("failed to run {cmd:?}; is git installed?"))?;
@@ -53,7 +53,18 @@ fn output(mut cmd: Command) -> Result<String> {
             String::from_utf8_lossy(&out.stderr).trim_end()
         );
     }
-    Ok(String::from_utf8(out.stdout)?)
+    Ok(out.stdout)
+}
+
+fn output(cmd: Command) -> Result<String> {
+    Ok(String::from_utf8(output_bytes(cmd)?)?)
+}
+
+/// Files that pre-commit hooks rewrote, with their final content, and
+/// whether the hooks passed once nothing more changed.
+pub struct Fixes {
+    pub files: Vec<(String, Vec<u8>)>,
+    pub passed: bool,
 }
 
 /// `git config --get`, distinguishing "unset" (exit 1) from real failures.
@@ -222,5 +233,39 @@ impl Shadow {
             );
         }
         Ok(passed)
+    }
+
+    /// Runs pre-commit hooks on the staged commit, staging whatever they
+    /// rewrite and running them again, as you would after a fixer fails a
+    /// `git commit`, until nothing changes.
+    pub fn run_fixers(&self) -> Result<Fixes> {
+        let mut touched = std::collections::BTreeSet::new();
+        for _ in 0..3 {
+            let passed = self.run_hook("pre-commit", &[], None)?;
+            let modified = output(git(&self.worktree, &["diff", "--name-only", "-z"]))?;
+            if modified.is_empty() {
+                let files = touched
+                    .into_iter()
+                    .map(|path: String| {
+                        let content = fs::read(self.worktree.join(&path)).with_context(|| {
+                            format!("a hook deleted {path}; tatami can only apply edits")
+                        })?;
+                        Ok((path, content))
+                    })
+                    .collect::<Result<_>>()?;
+                return Ok(Fixes { files, passed });
+            }
+            touched.extend(modified.split_terminator('\0').map(String::from));
+            output(git(&self.worktree, &["add", "-u"]))?;
+        }
+        bail!("pre-commit hooks were still changing files after 3 runs")
+    }
+
+    /// The content of `path` in `commit`.
+    pub fn blob(&self, commit: &str, path: &str) -> Result<Vec<u8>> {
+        output_bytes(git(
+            &self.worktree,
+            &["cat-file", "blob", &format!("{commit}:{path}")],
+        ))
     }
 }

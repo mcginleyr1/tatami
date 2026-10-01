@@ -59,9 +59,11 @@ jj push -b my-feature
 ```sh
 jj push -b my-feature              # check, then push
 jj push -c @-                      # anything `jj git push` accepts
+jj push -b my-feature --fix        # apply formatter fixes, then check and push
 jj push -b my-feature --no-verify  # skip the hooks
 tatami check                       # just run the hooks on trunk()..@
 tatami check -r 'mutable()'        # ...or on any revset
+tatami fix                         # apply the hooks' fixes to trunk()..@
 ```
 
 On each push, tatami runs:
@@ -77,32 +79,22 @@ On each push, tatami runs:
 **A hook failed on a commit.** tatami names the commit:
 
 ```
-tatami: pre-commit hooks failed for 3f9a2c1b7d4e add login form
+tatami: pre-commit hooks failed for qpvuntsmwlqt add login form
 ```
 
-Fix it in place, as usual with jj. Edit the files in your working copy, then:
+If it's something a formatter or fixer hook can fix (trailing whitespace,
+prettier, `ruff --fix`, ...), run `tatami fix` or push with `--fix`. Each
+commit is rewritten with exactly what its hooks changed, and commits on top
+of it get their own fixed versions, so there are no rebase conflicts.
+
+Anything else (a failing linter, a type error) you fix by hand, as usual with
+jj. Edit the files in your working copy, then either:
 
 - run `jj absorb` to move each fix into the commit that last touched those
   lines; or
-- run `jj squash --into 3f9a2c1b7d4e` to move all of `@` into that commit.
+- run `jj squash --into qpvuntsmwlqt` to move all of `@` into that commit.
 
 Then run `jj push` again.
-
-**A formatter "failed".** Hooks that rewrite files can't change your commits
-from inside tatami, so a reformat shows up as a failure. For formatters, use
-jj's own [`jj fix`](https://docs.jj-vcs.dev/latest/config/#code-formatting-and-other-file-content-transformations).
-It reformats every commit in your stack in place:
-
-```toml
-# jj config (jj config edit --repo)
-[fix.tools.black]
-command = ["black", "-", "--stdin-filename=$path"]
-patterns = ["glob:'**/*.py'"]
-```
-
-```sh
-jj fix && jj push -b my-feature
-```
 
 **`.pre-commit-config.yaml exists but no git hooks are installed`.** Your repo
 expects hooks, but none would run. tatami refuses rather than pass silently.
@@ -136,12 +128,19 @@ Because of this, every hook manager's own "staged files" logic sees exactly
 that commit's changes, wherever your working copy is. Hook config files are
 read from the commit being checked.
 
+`tatami fix` runs the same way, but keeps what the hooks rewrite, staging and
+rerunning them as you would after a fixer stops a `git commit`. It then has
+jj's own [`jj fix`](https://docs.jj-vcs.dev/latest/config/#code-formatting-and-other-file-content-transformations)
+write those files into the commits, with tatami as the only fix tool for that
+run. Your own `[fix.tools]` aren't run.
+
 ## Limitations
 
 - Plain `jj git push`, GUIs and IDEs bypass tatami. Use `jj push`, and keep CI
   as the final gate.
-- Hooks can't rewrite commits. That covers formatter fixes, and commit-msg
-  hooks that add trailers.
+- Only `tatami fix` (or `--fix`) writes hook changes back, and only edits to
+  existing files. Hooks that create or delete files, or commit-msg hooks that
+  add trailers, don't change your commits.
 - `pre-push` isn't run for bookmark deletions.
 - Hooks that look at branch names see a detached HEAD.
 - Tested with plain hook scripts and the pre-commit framework. prek, lefthook,
